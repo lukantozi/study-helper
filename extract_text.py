@@ -1,4 +1,5 @@
 import magic
+from rake_nltk import Rake
 import fitz 
 import docx
 
@@ -66,18 +67,22 @@ def extract_content():
             return extract_content()
 
 
-def chunk():
+def chunks():
     text = extract_content()
     n = 1000 # per question; switch to 10k-15k for 10-15 questions
     chunks = [text[i:i+n] for i in range(0, len(text), n)] # type: ignore
     return chunks
 
 
-#text = extract_from_pdf("test.pdf")
-#text = extract_from_docx("test.docx")
-#text = extract_from_txt("test.txt")
-#print(magic.from_file("test.docx", mime=True))
-#text = extract_content()
-#print(text)
-#for chunk in chunks:
-#    print(chunk)
+def extract_keywords():
+    r = Rake()
+    ch = chunks()
+    kw = []
+    for chunk in ch:
+        r.extract_keywords_from_text(chunk)
+        kw.append(r.get_ranked_phrases())
+    return kw
+        
+
+kw = extract_keywords()
+print(kw)
