@@ -20,3 +20,6 @@ build/
 dist/
 *.egg-info/
 
+/test.pdf
+/test.docx
+/test.txt
