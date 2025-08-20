@@ -68,7 +68,7 @@ def extract_content():
 
 def chunk():
     text = extract_content()
-    n = 1000 # per question
+    n = 1000 # per question; switch to 10k-15k for 10-15 questions
     chunks = [text[i:i+n] for i in range(0, len(text), n)] # type: ignore
     return chunks
 
