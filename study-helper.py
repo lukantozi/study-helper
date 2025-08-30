@@ -1,9 +1,17 @@
 import magic
+from ollama import Client
 from rake_nltk import Rake
 import fitz 
 import pandas
 import docx
 import re
+
+
+# change the model when using on pc
+OLLAMA_HOST = "http://localhost:11434"
+LLM_MODEL   = "qwen2.5:3b-instruct"
+
+ollama_client = Client(host=OLLAMA_HOST)
 
 
 def extract_from_txt(file_path):
@@ -97,6 +105,33 @@ def join_chunks(chunk_size, text):
     sentences = split_sentences(text)
     return chunks(chunk_size, sentences)
 
+def build_qg_prompt(chunk_text: str, n: int = 5) -> str:
+    return (
+        "Use only this chunk.\n"
+        f"Produce {n} open questions. For each item output exactly:\n"
+        "Q: …\n"
+        "A (3–4 sentences): …\n"
+        'EVIDENCE (copy exact sentence from the chunk, no paraphrase, no ellipses; include the final period; '
+        'if a sentence starts with a marker like “(2)”, omit the marker but keep the sentence text): "…"\n'
+        "RULES:\n"
+        "• Do not invent facts.\n"
+        "• Every number in A must also appear in EVIDENCE.\n"
+        "• If no single sentence supports A, choose a different question.\n\n"
+        "Chunk:\n"
+        f"{chunk_text}"
+    )
+
+
+def llm_generate_questions(chunk_text: str, n: int = 5, temperature: float = 0.2) -> str:
+    prompt = build_qg_prompt(chunk_text, n=n)
+    resp = ollama_client.generate(
+        model=LLM_MODEL,
+        prompt=prompt,
+        options={"temperature": temperature}
+    )
+    # Ollama returns a dict; the text is in 'response'
+    return resp["response"]
+
 
 def extract_keywords(chunks):
     r = Rake()
@@ -108,12 +143,17 @@ def extract_keywords(chunks):
         
 
 def test_main():
-    size = 1000
+    size = 1000 # per question
     mode = input_content()
     text = extract_content(mode)
     chunks = join_chunks(size, text)
-    kw = extract_keywords(chunks)
-    print(kw)
+    #kw = extract_keywords(chunks)
+    #print(kw)
+    chunk0 = chunks[0]
+    qa_text = llm_generate_questions(chunk0, n=5, temperature=0.2)
+
+    print("\n=== Q&A (chunk 0) ===\n")
+    print(qa_text)
 
 test_main()
 
