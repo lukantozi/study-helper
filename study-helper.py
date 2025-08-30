@@ -5,6 +5,7 @@ import pandas
 import docx
 import re
 
+
 def extract_from_txt(file_path):
     with open(file_path) as doc:
         text = doc.read()
@@ -44,8 +45,7 @@ def input_content():
     return mode
 
 
-def extract_content():
-    mode = input_content()
+def extract_content(mode):
     if mode == 1:
         content = input("Please paste the content here: ")
         return content
@@ -55,7 +55,7 @@ def extract_content():
         try:
             content_type = magic.from_file(content, mime=True)
         except FileNotFoundError:
-            return extract_content()
+            return extract_content(mode)
 
         if content_type == "text/plain":
             return extract_from_txt(content)
@@ -65,7 +65,7 @@ def extract_content():
             return extract_from_docx(content)
         else:
             print("Accepted formats: pdf, docx, txt")
-            return extract_content()
+            return extract_content(mode)
 
 
 def split_sentences(text):
@@ -109,7 +109,8 @@ def extract_keywords(chunks):
 
 def test_main():
     size = 1000
-    text = extract_content()
+    mode = input_content()
+    text = extract_content(mode)
     chunks = join_chunks(size, text)
     kw = extract_keywords(chunks)
     print(kw)
