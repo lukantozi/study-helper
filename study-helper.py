@@ -87,7 +87,6 @@ def chunks(chunk_size, sentences):
             if current_chunk:
                 chunks.append(current_chunk.strip())
             current_chunk = sentence.strip()
-
     if current_chunk:
         chunks.append(current_chunk.strip())
     
@@ -108,8 +107,6 @@ def extract_keywords(chunks):
     return kw
         
 
-#kw = extract_keywords()
-#print(kw)
 def test_main():
     size = 1000
     text = extract_content()
