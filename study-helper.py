@@ -1,4 +1,5 @@
 import magic
+import string
 from ollama import Client
 from rake_nltk import Rake
 import fitz 
@@ -12,6 +13,7 @@ OLLAMA_HOST = "http://localhost:11434"
 LLM_MODEL   = "qwen2.5:3b-instruct"
 
 ollama_client = Client(host=OLLAMA_HOST)
+translator = str.maketrans('', '', string.punctuation)
 
 
 def extract_from_txt(file_path):
@@ -81,10 +83,6 @@ def split_sentences(text):
 
 
 def chunks(chunk_size, sentences):
-#    text = extract_content()
-#    n = 1000 # per question; switch to 10k-15k for 10-15 questions
-#    chunks = [text[i:i+n] for i in range(0, len(text), n)] # type: ignore
-#    return chunks
     chunks = []
     current_chunk = ""
 
@@ -133,27 +131,44 @@ def llm_generate_questions(chunk_text: str, n: int = 5, temperature: float = 0.2
     return resp["response"]
 
 
-def extract_keywords(chunks):
+def extract_keywords(chunk):
     r = Rake()
     kw = []
-    for chunk in chunks:
-        r.extract_keywords_from_text(chunk)
-        kw.append(r.get_ranked_phrases())
-    return kw
+#    for chunk in chunks:
+#        r.extract_keywords_from_text(chunk)
+#        kw.append(r.get_ranked_phrases())
+    r.extract_keywords_from_text(chunk)
+    kw.append(r.get_ranked_phrases())
+    return kw[0][0:10]
         
+
+def validate_qs(chunk, keywords):
+    ch = ' '.join(chunk.lower().translate(translator).replace("-", " ").split())
+    kws = [' '.join(kw.lower().translate(translator).replace("-", " ").split()) for kw in keywords]
+    return ch, kws
+    
 
 def test_main():
     size = 1000 # per question
     mode = input_content()
     text = extract_content(mode)
     chunks = join_chunks(size, text)
-    #kw = extract_keywords(chunks)
-    #print(kw)
+#    kw = extract_keywords(chunks)
+#    print(kw)
     chunk0 = chunks[0]
-    qa_text = llm_generate_questions(chunk0, n=5, temperature=0.2)
+    kw_10 = extract_keywords(chunk0)
+#    compare_ch_kw(chunk0, kw_10)
+#    qa_text = llm_generate_questions(chunk0, n=5, temperature=0.2)
 
-    print("\n=== Q&A (chunk 0) ===\n")
-    print(qa_text)
+#    print("\n=== Q&A (chunk 0) ===\n")
+#    print(qa_text)
+    print(chunk0)
+    print(kw_10)
+    ch, kw = validate_qs(chunk0, kw_10)
+    print("----------------------")
+    print("----------------------")
+    print(ch)
+    print(kw)
 
 test_main()
 
