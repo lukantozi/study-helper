@@ -15,6 +15,27 @@ LLM_MODEL   = "qwen2.5:3b-instruct"
 ollama_client = Client(host=OLLAMA_HOST)
 translator = str.maketrans('', '', string.punctuation)
 
+EXTRA_DASHES = r"[–—−-]"  # en dash, em dash, minus, non-breaking hyphen
+
+
+def normalize_for_rake(s: str) -> str:
+    s = re.sub(EXTRA_DASHES, "-", s)
+    s = s.replace("\u00a0", " ")  # nbsp -> space
+    s = s.replace("-", " ")
+    # lowercase + collapse spaces
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+
+def normalize_for_match(s: str) -> str:
+    s = re.sub(EXTRA_DASHES, " ", s)
+    s = s.replace("\u00a0", " ")
+    s = s.replace("-", " ")
+    s = s.lower()
+    s = re.sub(r"[^\w\s]", " ", s)  # strip punctuation (ASCII + Unicode)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 
 def extract_from_txt(file_path):
     with open(file_path) as doc:
@@ -24,7 +45,7 @@ def extract_from_txt(file_path):
 
 def extract_from_pdf(file_path):
     doc = fitz.open(file_path)
-    return '\n'.join([page.get_text() for page in doc])
+    return '\n'.join([page.get_text("text") for page in doc])
 
 
 def extract_from_docx(file_path):
@@ -133,20 +154,21 @@ def llm_generate_questions(chunk_text: str, n: int = 5, temperature: float = 0.2
 
 def extract_keywords(chunk):
     r = Rake()
-    kw = []
-#    for chunk in chunks:
-#        r.extract_keywords_from_text(chunk)
-#        kw.append(r.get_ranked_phrases())
-    r.extract_keywords_from_text(chunk)
-    kw.append(r.get_ranked_phrases())
-    return kw[0][0:10]
+    text = normalize_for_rake(chunk)
+    r.extract_keywords_from_text(text)
+    phrases = r.get_ranked_phrases()
+    return phrases[:10]
         
 
-def validate_qs(chunk, keywords):
-    ch = ' '.join(chunk.lower().translate(translator).replace("-", " ").split())
-    kws = [' '.join(kw.lower().translate(translator).replace("-", " ").split()) for kw in keywords]
+def validate_qs(chunk, keywords, evidence):
+    ch = normalize_for_match(chunk)
+    kws = [normalize_for_match(kw) for kw in keywords]
     return ch, kws
     
+
+def extract_evidence(text):
+    pass
+
 
 def test_main():
     size = 1000 # per question
@@ -157,18 +179,20 @@ def test_main():
 #    print(kw)
     chunk0 = chunks[0]
     kw_10 = extract_keywords(chunk0)
-#    compare_ch_kw(chunk0, kw_10)
-#    qa_text = llm_generate_questions(chunk0, n=5, temperature=0.2)
-
+    qae_text = llm_generate_questions(chunk0, n=5, temperature=0.2)
+    ev = extract_evidence(qae_text)
 #    print("\n=== Q&A (chunk 0) ===\n")
-#    print(qa_text)
+#    print(qav_text)
     print(chunk0)
     print(kw_10)
-    ch, kw = validate_qs(chunk0, kw_10)
+    ch, kw = validate_qs(chunk0, kw_10, ev)
     print("----------------------")
     print("----------------------")
     print(ch)
     print(kw)
+    print("----------------------")
+    print("----------------------")
+    print(qae_text)
 
 test_main()
 
