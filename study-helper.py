@@ -10,7 +10,7 @@ import re
 
 # change the model when using on pc
 OLLAMA_HOST = "http://localhost:11434"
-LLM_MODEL   = "qwen2.5:3b-instruct"
+LLM_MODEL   = "qwen2.5:7b-instruct"
 
 ollama_client = Client(host=OLLAMA_HOST)
 translator = str.maketrans('', '', string.punctuation)
