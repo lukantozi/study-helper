@@ -124,7 +124,7 @@ def join_chunks(chunk_size, text):
     sentences = split_sentences(text)
     return chunks(chunk_size, sentences)
 
-def build_qg_prompt(chunk_text: str, a, b, n: int = 3) -> str:
+def build_qg_prompt(chunk_text: str, a, b, n: int = 2) -> str:
     return (
         "Use only this chunk.\n"
         f"Produce {n} open questions. For each item output exactly:\n"
@@ -142,7 +142,15 @@ def build_qg_prompt(chunk_text: str, a, b, n: int = 3) -> str:
 
 #     "(Answer with 3-4 sentences) Format -> A: …\n"
 
-def llm_generate_questions(chunk_text: str, anchor_a, anchor_b, n: int = 3, temperature: float = 0.2) -> str:
+def llm_generate_questions(chunk_text: str, anchor_a, anchor_b, q=None, n: int = 2, temperature: float = 0.2) -> str:
+    if q:
+        resp = ollama_client.generate(
+                model=LLM_MODEL,
+                prompt=f"Regenerate the question: {q}, with the same rules before",
+                options={"temperature": temperature}
+        )
+        return resp["response"]
+
     prompt = build_qg_prompt(chunk_text, n=n, a=anchor_a, b=anchor_b)
     resp = ollama_client.generate(
         model=LLM_MODEL,
@@ -163,92 +171,72 @@ def extract_keywords(chunk):
 
 def validate_qs(chunk, keywords, evidence):
     ch = normalize_for_match(chunk)
+    ev = normalize_for_match(evidence)
     kws = [normalize_for_match(kw) for kw in keywords]
-    return ch, kws
+    return ch, kws, ev
     
 
-def check_match(text, subtext): 
+def check_match(text, subtext, q): 
     if isinstance(subtext, list):
         for sub in subtext:
             match = text.find(sub)
             print(match)
             if match != -1:
                 print(f"{sub} ---- {match}")
-                # continue
-            #else:
-                # generate the question again
+                break
+        # generate the question again
+
     else:
         match = text.find(subtext)
         print(match)
         print(text)
         if match != -1:
             print(f"{subtext} ---- {match}")
-            # continue
-        #else: 
+            return
+        else: 
             # generate the question again
+            pass
 
 
-def extract_evidence(text):
-    return text.split("E: ",1)[1]
-
+def extract_q_e(text):
+    evidence = text.split("E: ",1)[1]
+    question = (text.split("Q1: ")[1]).split("E: ")[0]
+    return evidence, question
 
 def test_main():
     size = 1000 # per question
     mode = input_content()
     text = extract_content(mode)
     chunks = join_chunks(size, text)
-#    kw = extract_keywords(chunks)
-#    print(kw)
     chunk0 = chunks[0]
     kw_8 = extract_keywords(chunk0)
     anchor_A = kw_8[0]
     anchor_B = kw_8[1]
     qe_text = llm_generate_questions(chunk0, anchor_A, anchor_B, n=1, temperature=0.2)
-    ev = extract_evidence(qe_text)
-#    print("\n=== Q&A (chunk 0) ===\n")
-#    print(qav_text)
-    print(chunk0)
-    print(kw_8)
-    ch, kw = validate_qs(chunk0, kw_8, ev)
+    evidence, q = extract_q_e(qe_text)
+    print(q)
+    ch, kw, ev = validate_qs(chunk0, kw_8, evidence)
     print("----------------------")
+    print("-----chunk------------")
     print("----------------------")
     print(ch)
+    print("----------------------")
+    print("-----keywords---------")
+    print("----------------------")
     print(kw)
     print("----------------------")
+    print("--generated text------")
     print("----------------------")
     print(qe_text)
-    evidence = extract_evidence(qe_text)
-    print(evidence)
-    norm_chunk0 = normalize_for_match(chunk0)
-    norm_ev = normalize_for_match(evidence)
-    check_match(norm_chunk0, norm_ev)
-
     print("----------------------")
+    print("--evidence in chunk---")
     print("----------------------")
+    check_match(ch, ev, q)
     print("----------------------")
-    check_match(norm_ev, kw)
+    print("---keywords in ev-----")
+    print("----------------------")
+    check_match(ev, kw, q)
 
 
 test_main()
-
-
-def match_evidence_to_keywords():
-    size = 1000 # per question
-    mode = input_content()
-    text = extract_content(mode)
-    chunks = join_chunks(size, text)
-#   kw = extract_keywords(chunks)
-#   print(kw)
-    chunk0 = chunks[0]
-    kw_8 = extract_keywords(chunk0)
-    evidence = "E: One key aspect of crisis management is having a well-defined plan in place before a crisis occurs. This plan should outline the steps to be taken in different scenarios, designate roles and responsibilities, and establish communication channels. By preparing in advance, organizations can respond more swiftly and effectively when a crisis hits, minimizing potential damage."
-    print(kw_8)
-    print("=========")
-    print("=========")
-    print("=========")
-    print(evidence)
-    print("=========")
-    text = evidence[3:]
-        
-#match_evidence_to_keywords()
-    
+   
