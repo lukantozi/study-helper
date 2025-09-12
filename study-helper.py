@@ -22,6 +22,10 @@ def normalize_for_rake(s: str) -> str:
     s = re.sub(EXTRA_DASHES, "-", s)
     s = s.replace("\u00a0", " ")  # nbsp -> space
     s = s.replace("-", " ")
+    # drop section markers like (1) (2) (3)
+    s = re.sub(r"\(\d+\)\s*", "", s)
+    # drop header lines like "Reading Material 1 – ..."
+    s = re.sub(r"^reading material\s*\d*\s*[-–—]?\s*.*$", "", s, flags=re.I | re.M)
     # lowercase + collapse spaces
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
@@ -124,41 +128,52 @@ def join_chunks(chunk_size, text):
     sentences = split_sentences(text)
     return chunks(chunk_size, sentences)
 
-def build_qg_prompt(chunk_text: str, a, b, n: int = 2) -> str:
+def build_qg_prompt(chunk_text: str, a) -> str:
     return (
         "Use only this chunk.\n"
-        f"Produce {n} open questions. For each item output exactly:\n"
-        "(Questions should prompt 3-4 sentence answer) Format -> Q(question number): …\n"
-        f"• Q1 about {a}."
-        f"• Q2 about {b}."
-        "EVIDENCE (copy exact sentence from the chunk, no paraphrase, no ellipses; include the final period; Format -> E:"
-        'if a sentence starts with a marker like “(2)”, omit the marker but keep the sentence text): "…"\n'
-        "RULES:\n"
-        "• Do not invent facts.\n"
-        "• If no single sentence supports A, choose a different question.\n\n"
-        "Chunk:\n"
-        f"{chunk_text}"
+        f'Ask ONE open question about the anchor phrase: "{a}".\n'
+        "Output exactly these three lines, in this order:\n"
+        "Q: <one question>\n"
+        "A: <2–3 sentences>\n"
+        'E: "<copy ONE exact sentence from the chunk; no paraphrase; include the final period>"\n'
+        "Rules: Do not invent facts. If no single sentence supports A, choose a different question.\n\n"
+        f"Chunk:\n{chunk_text}"
     )
 
 #     "(Answer with 3-4 sentences) Format -> A: …\n"
 
-def llm_generate_questions(chunk_text: str, anchor_a, anchor_b, q=None, n: int = 2, temperature: float = 0.2) -> str:
+def build_reg_prompt(chunk_text: str, a, q) -> str:
+    return(
+        "Use only this chunk.\n"
+        f'Regenerate this question about "{a}": {q}\n'
+        "Output exactly:\n"
+        "Q: <one question>\n"
+        "A: <2–3 sentences>\n"
+        'E: "<one exact sentence from the chunk; include the final period>"\n'
+        "Reason: previous attempt failed formatting/verification.\n\n"
+        f"Chunk:\n{chunk_text}"
+    )
+
+
+def llm_generate_questions(chunk_text: str, anchor, q=None, temperature: float = 0.2) -> str:
     if q:
+        prompt = build_reg_prompt(chunk_text, anchor, q) 
         resp = ollama_client.generate(
                 model=LLM_MODEL,
-                prompt=f"Regenerate the question: {q}, with the same rules before",
+                prompt=prompt,
                 options={"temperature": temperature}
         )
         return resp["response"]
 
-    prompt = build_qg_prompt(chunk_text, n=n, a=anchor_a, b=anchor_b)
-    resp = ollama_client.generate(
-        model=LLM_MODEL,
-        prompt=prompt,
-        options={"temperature": temperature}
-    )
-    # Ollama returns a dict; the text is in 'response'
-    return resp["response"]
+    else:
+        prompt = build_qg_prompt(chunk_text, anchor)
+        resp = ollama_client.generate(
+            model=LLM_MODEL,
+            prompt=prompt,
+            options={"temperature": temperature}
+        )
+        # Ollama returns a dict; the text is in 'response'
+        return resp["response"]
 
 
 def extract_keywords(chunk):
@@ -176,46 +191,48 @@ def validate_qs(chunk, keywords, evidence):
     return ch, kws, ev
     
 
-def check_match(text, subtext, q): 
-    if isinstance(subtext, list):
-        for sub in subtext:
-            match = text.find(sub)
-            print(match)
-            if match != -1:
-                print(f"{sub} ---- {match}")
-                break
-        # generate the question again
+def check_anchor_evidence(ev, q, anchor, raw_chunk, anchor_raw): 
+    match = ev.find(anchor)
+    print(match)
+    if match != -1:
+        print(f"{ev} ---- {anchor}")
+        return
+    # evidence not in chunk, generate the question again
+    llm_generate_questions(raw_chunk, anchor_raw, q=q, temperature=0.2)
 
-    else:
-        match = text.find(subtext)
-        print(match)
-        print(text)
-        if match != -1:
-            print(f"{subtext} ---- {match}")
-            return
-        else: 
-            # generate the question again
-            pass
+
+def check_evidence_chunk(evidence, anchor_raw, q, chunk):
+    match = chunk.find(evidence)
+    print(match)
+    if match != -1:
+        print(f"{evidence}----{chunk}")
+        return
+    # keywords not in evidence, generate the question again
+    llm_generate_questions(chunk, anchor_raw, q=q, temperature=0.2)
 
 
 def extract_q_e(text):
-    evidence = text.split("E: ",1)[1]
-    question = (text.split("Q1: ")[1]).split("E: ")[0]
-    return evidence, question
+    q = text.split("Q:", 1)[1].split("\n", 1)[0].strip()
+    e = text.split('E:', 1)[1].strip()
+    # strip surrounding quotes if present
+    if e.startswith('"') and '"' in e[1:]:
+        e = e[1:e[1:].find('"')+1]  # keep inside quotes incl. closing quote
+        e = e.strip('"').strip()
+    return e, q
 
 def test_main():
-    size = 1000 # per question
+    size = 500# per question
     mode = input_content()
     text = extract_content(mode)
     chunks = join_chunks(size, text)
     chunk0 = chunks[0]
     kw_8 = extract_keywords(chunk0)
-    anchor_A = kw_8[0]
-    anchor_B = kw_8[1]
-    qe_text = llm_generate_questions(chunk0, anchor_A, anchor_B, n=1, temperature=0.2)
+    anchor_raw = kw_8[0]
+    qe_text = llm_generate_questions(chunk0, anchor_raw, q=None, temperature=0.2)
     evidence, q = extract_q_e(qe_text)
     print(q)
     ch, kw, ev = validate_qs(chunk0, kw_8, evidence)
+    anchor_norm = kw[0]
     print("----------------------")
     print("-----chunk------------")
     print("----------------------")
@@ -230,13 +247,24 @@ def test_main():
     print(qe_text)
     print("----------------------")
     print("--evidence in chunk---")
+    check_evidence_chunk(evidence, anchor_raw, q, chunk0)
     print("----------------------")
-    check_match(ch, ev, q)
     print("----------------------")
     print("---keywords in ev-----")
     print("----------------------")
-    check_match(ev, kw, q)
+    check_anchor_evidence(ev, q, anchor_norm, chunk0, anchor_raw)
 
 
 test_main()
-   
+
+def main():
+    size = 500# per question
+    mode = input_content()
+    text = extract_content(mode)
+    chunks = join_chunks(size, text)
+    for chunk in chunks:
+        kw_8 = extract_keywords(chunk)
+        anchor = kw_8[0]
+        qe_text = llm_generate_questions(chunk, anchor, q=None, temperature=0.2)
+        evidence, q = extract_q_e(qe_text)
+
