@@ -201,14 +201,15 @@ def check_anchor_evidence(ev, q, anchor, raw_chunk, anchor_raw):
     llm_generate_questions(raw_chunk, anchor_raw, q=q, temperature=0.2)
 
 
-def check_evidence_chunk(evidence, anchor_raw, q, chunk):
-    match = chunk.find(evidence)
+def check_evidence_chunk(evidence, anchor_raw, q, chunk_norm, chunk_raw):
+    match = chunk_norm.find(evidence)
     print(match)
+    print(f"{evidence}----{chunk_norm}")
     if match != -1:
-        print(f"{evidence}----{chunk}")
+        print(f"{evidence}----{chunk_norm}")
         return
     # keywords not in evidence, generate the question again
-    llm_generate_questions(chunk, anchor_raw, q=q, temperature=0.2)
+    llm_generate_questions(chunk_raw, anchor_raw, q=q, temperature=0.2)
 
 
 def extract_q_e(text):
@@ -247,7 +248,7 @@ def test_main():
     print(qe_text)
     print("----------------------")
     print("--evidence in chunk---")
-    check_evidence_chunk(evidence, anchor_raw, q, chunk0)
+    check_evidence_chunk(ev, anchor_raw, q, ch, chunk0)
     print("----------------------")
     print("----------------------")
     print("---keywords in ev-----")
