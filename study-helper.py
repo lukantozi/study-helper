@@ -195,21 +195,18 @@ def check_anchor_evidence(ev, q, anchor, raw_chunk, anchor_raw):
     match = ev.find(anchor)
     print(match)
     if match != -1:
-        print(f"{ev} ---- {anchor}")
-        return
-    # evidence not in chunk, generate the question again
-    llm_generate_questions(raw_chunk, anchor_raw, q=q, temperature=0.2)
+        return None
+    else:
+        return llm_generate_questions(raw_chunk, anchor_raw, q=q, temperature=0.2)
 
 
 def check_evidence_chunk(evidence, anchor_raw, q, chunk_norm, chunk_raw):
     match = chunk_norm.find(evidence)
     print(match)
-    print(f"{evidence}----{chunk_norm}")
     if match != -1:
-        print(f"{evidence}----{chunk_norm}")
-        return
-    # keywords not in evidence, generate the question again
-    llm_generate_questions(chunk_raw, anchor_raw, q=q, temperature=0.2)
+        return None
+    else:
+        return llm_generate_questions(chunk_raw, anchor_raw, q=q, temperature=0.2)
 
 
 def extract_q_e(text):
@@ -226,35 +223,27 @@ def test_main():
     mode = input_content()
     text = extract_content(mode)
     chunks = join_chunks(size, text)
-    chunk0 = chunks[0]
-    kw_8 = extract_keywords(chunk0)
-    anchor_raw = kw_8[0]
-    qe_text = llm_generate_questions(chunk0, anchor_raw, q=None, temperature=0.2)
-    evidence, q = extract_q_e(qe_text)
-    print(q)
-    ch, kw, ev = validate_qs(chunk0, kw_8, evidence)
-    anchor_norm = kw[0]
-    print("----------------------")
-    print("-----chunk------------")
-    print("----------------------")
-    print(ch)
-    print("----------------------")
-    print("-----keywords---------")
-    print("----------------------")
-    print(kw)
-    print("----------------------")
-    print("--generated text------")
-    print("----------------------")
-    print(qe_text)
-    print("----------------------")
-    print("--evidence in chunk---")
-    check_evidence_chunk(ev, anchor_raw, q, ch, chunk0)
-    print("----------------------")
-    print("----------------------")
-    print("---keywords in ev-----")
-    print("----------------------")
-    check_anchor_evidence(ev, q, anchor_norm, chunk0, anchor_raw)
 
+    for chunk in chunks:
+        kw_8 = extract_keywords(chunk)
+        anchor_raw = kw_8[0]
+
+        qe_text = llm_generate_questions(chunk, anchor_raw, q=None, temperature=0.2)
+        evidence, q = extract_q_e(qe_text)
+
+        ch, kw, ev = validate_qs(chunk, kw_8, evidence)
+        anchor_norm = kw[0]
+
+        checked_text = check_evidence_chunk(ev, anchor_raw, q, ch, chunk) # None or response
+        if checked_text:
+            evidence, q = extract_q_e(checked_text)
+            ev = normalize_for_match(evidence)
+
+        checked_text = check_anchor_evidence(ev, q, anchor_norm, chunk, anchor_raw) # None or response
+        if checked_text:
+            evidence, q = extract_q_e(checked_text)
+
+        print(q)
 
 test_main()
 
