@@ -21,6 +21,7 @@ dist/
 *.egg-info/
 
 /test.pdf
+/mit_42j.pdf
 /test.docx
 /test.txt
 /ScientificArticleSturucture.pdf
