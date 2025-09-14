@@ -8,7 +8,7 @@ import docx
 import re
 
 
-# change the model when using on pc
+# change the model when switching pc/laptop
 OLLAMA_HOST = "http://localhost:11434"
 LLM_MODEL   = "qwen2.5:7b-instruct"
 
@@ -134,13 +134,13 @@ def build_qg_prompt(chunk_text: str, a) -> str:
         f'Ask ONE open question about the anchor phrase: "{a}".\n'
         "Output exactly these three lines, in this order:\n"
         "Q: <one question>\n"
-        "A: <2–3 sentences>\n"
+        "A: <3–4 sentences>\n"
         'E: "<copy ONE exact sentence from the chunk; no paraphrase; include the final period>"\n'
-        "Rules: Do not invent facts. If no single sentence supports A, choose a different question.\n\n"
+        "Rules: Do not invent facts. If no single sentence supports A, choose a different question.\n"
+        "       Question has to prompt the student to answer with the 3-4 sentences (spaced repetition method).\n\n"
         f"Chunk:\n{chunk_text}"
     )
 
-#     "(Answer with 3-4 sentences) Format -> A: …\n"
 
 def build_reg_prompt(chunk_text: str, a, q) -> str:
     return(
@@ -148,9 +148,11 @@ def build_reg_prompt(chunk_text: str, a, q) -> str:
         f'Regenerate this question about "{a}": {q}\n'
         "Output exactly:\n"
         "Q: <one question>\n"
-        "A: <2–3 sentences>\n"
+        "A: <3–4 sentences>\n"
         'E: "<one exact sentence from the chunk; include the final period>"\n'
         "Reason: previous attempt failed formatting/verification.\n\n"
+        "Rules: Do not invent facts. If no single sentence supports A, choose a different question.\n"
+        "       Question has to prompt the student to answer with the 3-4 sentences (spaced repetition method).\n\n"
         f"Chunk:\n{chunk_text}"
     )
 
@@ -182,31 +184,6 @@ def extract_keywords(chunk):
     r.extract_keywords_from_text(text)
     phrases = r.get_ranked_phrases()
     return phrases[:8]
-        
-
-def validate_qs(chunk, keywords, evidence):
-    ch = normalize_for_match(chunk)
-    ev = normalize_for_match(evidence)
-    kws = [normalize_for_match(kw) for kw in keywords]
-    return ch, kws, ev
-    
-
-def check_anchor_evidence(ev, q, anchor, raw_chunk, anchor_raw): 
-    match = ev.find(anchor)
-    print(match)
-    if match != -1:
-        return None
-    else:
-        return llm_generate_questions(raw_chunk, anchor_raw, q=q, temperature=0.2)
-
-
-def check_evidence_chunk(evidence, anchor_raw, q, chunk_norm, chunk_raw):
-    match = chunk_norm.find(evidence)
-    print(match)
-    if match != -1:
-        return None
-    else:
-        return llm_generate_questions(chunk_raw, anchor_raw, q=q, temperature=0.2)
 
 
 def extract_q_e(text):
@@ -217,31 +194,70 @@ def extract_q_e(text):
         e = e[1:e[1:].find('"')+1]  # keep inside quotes incl. closing quote
         e = e.strip('"').strip()
     return e, q
+        
+
+def validate_qs(chunk, keywords, evidence):
+    ch = normalize_for_match(chunk)
+    ev = normalize_for_match(evidence)
+    kws = [normalize_for_match(kw) for kw in keywords]
+    return ch, kws, ev
+    
+
+def check_evidence_chunk(chunk_norm, chunk_raw, anchor_norm, anchor_raw, ev, q, kw_8):
+    match = chunk_norm.find(ev)
+    print(match)
+    if match != -1:
+        checked = False
+        return check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, ev, q, kw_8, checked)
+    else:
+        response = llm_generate_questions(chunk_raw, anchor_raw, q=q, temperature=0.4) # trying higher temperature for regeneration
+        ev, q = extract_q_e(response)
+        ev = normalize_for_match(ev)
+        check_evidence_chunk(chunk_norm, chunk_raw, anchor_norm, anchor_raw, ev, q, kw_8)
+
+
+def check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, ev, q, kw_8, checked): 
+    if checked:
+        ind = kw_8.index(anchor_raw)
+        anchor_norm = normalize_for_match(kw_8[ind+1])
+        checked = False
+    match = ev.find(anchor_norm)
+    print(match)
+    if match != -1:
+        return q
+    else:
+        response = llm_generate_questions(chunk_raw, anchor_raw, q, temperature=0.4) # trying higher temperature for regeneration
+        checked = True
+        ev, q = extract_q_e(response)
+        ev = normalize_for_match(ev)
+        check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, ev, q, kw_8, checked)
+
+
+def regenerate_check(chunk_norm, chunk_raw, anchor_norm, anchor_raw, ev, q, kw_8):
+    checked_text = check_evidence_chunk(chunk_norm, chunk_raw, anchor_norm, anchor_raw, ev, q, kw_8) # None or response
+    if checked_text:
+        evidence, q = extract_q_e(checked_text)
+        ev = normalize_for_match(evidence)
+
+    return q
 
 def test_main():
-    size = 500# per question
+    size = 500 # per question
     mode = input_content()
     text = extract_content(mode)
     chunks = join_chunks(size, text)
 
-    for chunk in chunks:
-        kw_8 = extract_keywords(chunk)
+    for chunk_raw in chunks:
+        kw_8 = extract_keywords(chunk_raw)
         anchor_raw = kw_8[0]
 
-        qe_text = llm_generate_questions(chunk, anchor_raw, q=None, temperature=0.2)
-        evidence, q = extract_q_e(qe_text)
+        response = llm_generate_questions(chunk_raw, anchor_raw, q=None, temperature=0.2)
+        evidence, q = extract_q_e(response)
 
-        ch, kw, ev = validate_qs(chunk, kw_8, evidence)
-        anchor_norm = kw[0]
+        chunk_norm, _, ev = validate_qs(chunk_raw, kw_8, evidence)
+        anchor_norm = kw_8[0]
 
-        checked_text = check_evidence_chunk(ev, anchor_raw, q, ch, chunk) # None or response
-        if checked_text:
-            evidence, q = extract_q_e(checked_text)
-            ev = normalize_for_match(evidence)
-
-        checked_text = check_anchor_evidence(ev, q, anchor_norm, chunk, anchor_raw) # None or response
-        if checked_text:
-            evidence, q = extract_q_e(checked_text)
+        q = check_evidence_chunk(chunk_norm, chunk_raw, anchor_norm, anchor_raw, ev, q, kw_8)
 
         print(q)
 
