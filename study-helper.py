@@ -706,6 +706,7 @@ def test_main():
     chunks = join_chunks(size, text)
     chunk_counter = 0
     ans_bank = []
+    emit_idx = 0
     # === outputs ===
     out_dir = "runs"
     os.makedirs(out_dir, exist_ok=True)
@@ -718,7 +719,7 @@ def test_main():
         open(jsonl_path, "w").close()
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="") as f:
-            csv.writer(f).writerow(["chunk_idx", "anchor", "Q", "A", "E"])
+            csv.writer(f).writerow(["q_idx", "chunk_idx", "anchor", "Q", "A", "E"])
 
     # === de-dupe state ===
     _seen_norm_qs: set[str] = set()
@@ -761,6 +762,7 @@ def test_main():
         # write to JSONL
         with open(jsonl_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({
+                "q_idx": emit_idx + 1,
                 "chunk_idx": chunk_counter,
                 "anchor": anchor_raw,
                 "Q": q,
@@ -770,14 +772,15 @@ def test_main():
 
         # write to CSV
         with open(csv_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([chunk_counter, anchor_raw, q, a, evidence])
+            csv.writer(f).writerow([emit_idx + 1, chunk_counter, anchor_raw, q, a, evidence])
 
         # keep for optional on-screen answers
         ans_bank.append(a)
 
         # show the question index + text
-        print(chunk_counter)
+        print(emit_idx + 1)
         print(q)
+        emit_idx += 1
 
 
 
