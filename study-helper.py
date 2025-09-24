@@ -1,4 +1,5 @@
 import magic
+import mimetypes
 import string
 from ollama import Client
 from rake_nltk import Rake
@@ -10,6 +11,7 @@ try:
     _NLP = spacy.load("en_core_web_sm")
 except Exception:
     _NLP = None
+import random
 
 
 
@@ -51,27 +53,19 @@ def _canonicalize_tags(t: str) -> str:
     return t.strip()
 
 def parse_qae(text: str) -> dict:
-    """
-    Parse ONE Q/A/E triple from model output.
-    Returns: {'ok': bool, 'q': str|None, 'a': str|None, 'e': str|None, 'raw': str, 'missing': set()}
-    - 'a' can be multi-line; we stop at the next 'E:' line
-    - 'e' is unquoted (quotes removed if present)
-    """
     raw = _canonicalize_tags(_strip_code_fences(text))
 
-    # Grab Q
     m_q = re.search(r'(?m)^Q:\s*(.*)$', raw)
     q = m_q.group(1).strip() if m_q else None
 
-    # Grab A (multi-line, non-greedy, until next E:)
-    m_a = re.search(r'(?ms)^A:\s*(.*?)\n\s*E:\s*', raw)
+    # A: capture until E: OR end of string
+    m_a = re.search(r'(?ms)^A:\s*(.*?)(?:\n\s*E:\s*|$)', raw)
     a = m_a.group(1).strip() if m_a else None
 
-    # Grab E (to end of string)
-    m_e = re.search(r'(?m)^E:\s*(.*)$', raw)
+    # E: capture line or remainder after E:
+    m_e = re.search(r'(?ms)^E:\s*(.*)$', raw)
     e = m_e.group(1).strip() if m_e else None
     if e:
-        # remove surrounding quotes if present
         e = e.strip().strip('"“”„').strip()
 
     missing = set()
@@ -80,6 +74,7 @@ def parse_qae(text: str) -> dict:
     if not e: missing.add('E')
 
     return {'ok': len(missing) == 0, 'q': q, 'a': a, 'e': e, 'raw': raw, 'missing': missing}
+
 
 def parse_qae_items(text: str) -> list[dict]:
     """
@@ -120,9 +115,9 @@ def normalize_for_match(s: str) -> str:
 
 
 def extract_from_txt(file_path):
-    with open(file_path) as doc:
-        text = doc.read()
-    return text
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as doc:
+        return doc.read()
+
 
 
 def extract_from_pdf(
@@ -330,25 +325,29 @@ def input_content():
 
 def extract_content(mode):
     if mode == 1:
-        content = input("Please paste the content here: ")
-        return content
-    elif mode == 2:
-        content = input("Please input the filepath here: ")
+        return input("Please paste the content here: ")
 
-        try:
-            content_type = magic.from_file(content, mime=True)
-        except FileNotFoundError:
-            return extract_content(mode)
+    # mode == 2
+    path = input("Please input the filepath here: ").strip()
+    if not os.path.exists(path):
+        print("File not found. Try again.")
+        return extract_content(2)
 
-        if content_type == "text/plain":
-            return extract_from_txt(content)
-        elif content_type == "application/pdf":
-            return extract_from_pdf(content)
-        elif content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            return extract_from_docx(content)
-        else:
-            print("Accepted formats: pdf, docx, txt")
-            return extract_content(mode)
+    try:
+        content_type = magic.from_file(path, mime=True)  # may fail on some systems
+    except Exception:
+        guess, _ = mimetypes.guess_type(path)
+        content_type = guess or ""
+
+    if content_type in ("text/plain",):
+        return extract_from_txt(path)
+    elif content_type in ("application/pdf",) or path.lower().endswith(".pdf"):
+        return extract_from_pdf(path)
+    elif content_type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",) or path.lower().endswith(".docx"):
+        return extract_from_docx(path)
+    else:
+        print("Accepted formats: pdf, docx, txt")
+        return extract_content(2)
 
 
 def split_sentences(text):
@@ -418,26 +417,31 @@ def build_reg_prompt(chunk_text: str, a, q) -> str:
     )
 
 
+def _ollama_generate_with_retries(model: str, prompt: str, options: dict, retries: int = 3, base_sleep: float = 0.8) -> str:
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = ollama_client.generate(model=model, prompt=prompt, options=options)
+            return resp.get("response", "")
+        except Exception as e:
+            last_err = e
+            time.sleep(base_sleep * attempt)
+    raise RuntimeError(f"Ollama generate failed after {retries} tries: {last_err}")
+
 def llm_generate_questions(chunk_text: str, anchor, q=None, temperature: float = 0.2) -> str:
+    # Use the function arg; set a seed for determinism; avoid overshooting context.
     opts = {
-        "temperature": 0.4,
+        "temperature": max(0.0, min(1.0, float(temperature))),
         "top_p": 0.95,
         "num_predict": 300,
-        "gpu_layers": 99,   # offload as many as possible
-        "num_ctx": 1024,    # match your service OLLAMA_CONTEXT_LENGTH
-        "num_batch": 256,   # bigger batch -> faster on GPU
+        # Let Ollama choose GPU offload; hardcoding 99 can fail on some boxes.
+        # "gpu_layers": 0,
+        "num_ctx": 4096,     # safer headroom
+        "num_batch": 64,     # conservative; reduces VRAM hiccups
+        "seed": 12345,       # deterministic outputs for the same input
     }
-    if q:
-        prompt = build_reg_prompt(chunk_text, anchor, q)
-    else:
-        prompt = build_qg_prompt(chunk_text, anchor)
-
-    resp = ollama_client.generate(
-        model=LLM_MODEL,
-        prompt=prompt,
-        options=opts
-    )
-    return resp["response"]
+    prompt = build_reg_prompt(chunk_text, anchor, q) if q else build_qg_prompt(chunk_text, anchor)
+    return _ollama_generate_with_retries(LLM_MODEL, prompt, opts, retries=3, base_sleep=0.8)
 
 
 def get_qae_or_regen(chunk_raw: str, anchor_raw: str, prev_q: str | None = None):
@@ -584,16 +588,16 @@ def quality_ok(anchor_raw, q, a, e, chunk_raw) -> bool:
         return False
     if normalize_for_match(anchor_raw) not in normalize_for_match(q):
         return False
-    if normalize_for_match(anchor_raw) not in normalize_for_match(e):
-        return False
-    if normalize_for_match(e) not in normalize_for_match(chunk_raw):
+    # Accept normalized evidence containment (earlier stage already checked)
+    if _normalize_for_verbatim(e) not in _normalize_for_verbatim(chunk_raw):
         return False
     sc = _sentence_count(a)
-    if sc < 2 or sc > 5:
+    if sc < 2 or sc > 6:
         return False
     if BAD_ANCHOR_PAT.search(q.lower()):
         return False
     return True
+
 
 def extract_q_e(text):
     q = text.split("Q:", 1)[1].split("\n", 1)[0].strip()
@@ -612,21 +616,28 @@ def validate_qs(chunk, keywords, evidence):
     return ch, kws, ev
     
 
+def _normalize_for_verbatim(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(EXTRA_DASHES, "-", s)
+    s = s.replace("\u00a0", " ")
+    s = s.replace("“", '"').replace("”", '"').replace("„", '"').replace("’", "'")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 def check_evidence_chunk(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, q_raw, a_raw, kw_8, regen_left=1):
-    """
-    1) Evidence must be verbatim substring of RAW chunk.
-    2) If not, try one regen (parse with parse_qae) and re-check.
-    3) If still bad and regen_left exhausted, return what we have.
-    """
-    # VERBATIM check uses RAW strings
-    if e_raw and e_raw in chunk_raw:
-        return check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, q_raw, a_raw, kw_8, regen_left)
+    # First try relaxed containment on normalized strings
+    if e_raw:
+        e_norm = _normalize_for_verbatim(e_raw)
+        chunk_norm2 = _normalize_for_verbatim(chunk_raw)
+        if e_norm and e_norm in chunk_norm2:
+            return check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, q_raw, a_raw, kw_8, regen_left)
 
     if regen_left <= 0:
         return q_raw, a_raw, e_raw
 
-    # Regenerate with same anchor and previous question; PARSE Q/A/E
-    resp = llm_generate_questions(chunk_raw, anchor_raw, q=q_raw, temperature=0.4)
+    # Regenerate once, then re-check
+    resp = llm_generate_questions(chunk_raw, anchor_raw, q=q_raw, temperature=0.3)
     item = parse_qae(resp)
     if not item['ok']:
         return q_raw, a_raw, e_raw
@@ -635,6 +646,7 @@ def check_evidence_chunk(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, 
         chunk_norm, chunk_raw, anchor_norm, anchor_raw,
         item['e'], item['q'], item['a'], kw_8, regen_left=0
     )
+
 
 
 def check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, q_raw, a_raw, kw_8, regen_left):
@@ -701,6 +713,7 @@ def _near_dupe(q: str, seen_norm_qs: set[str], seen_token_sets: list[set[str]], 
 
 def test_main():
     size = 1500 # per question
+    MAX_QUESTIONS = 24
     mode = input_content()
     text = extract_content(mode)
     chunks = join_chunks(size, text)
@@ -771,6 +784,8 @@ def test_main():
             }, ensure_ascii=False) + "\n")
 
         # write to CSV
+        if emit_idx >= MAX_QUESTIONS:
+            break
         with open(csv_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([emit_idx + 1, chunk_counter, anchor_raw, q, a, evidence])
 
