@@ -394,6 +394,7 @@ def build_qg_prompt(chunk_text: str, a) -> str:
         "• Start with How / Why / Explain / Compare / Under what conditions (avoid “What is…?” unless it’s a formal definition).\n"
         "• No ‘in the text/passage/chunk’. No invented facts. If no single sentence supports A, choose a different question.\n"
         f"• Make A **broad** (cover at least two distinct points from the chunk related to {a}) but still supported by E.\n\n"
+        "• Prefer How/Why/Compare, but “What … ?” is allowed for formal definitions.\n\n"
         "Good example:\n"
         f"{FEW_SHOT}\n\n"
         f"Chunk:\n{chunk_text}"
@@ -413,6 +414,7 @@ def build_reg_prompt(chunk_text: str, a, q) -> str:
         "• No “mentioned in the chunk/text”. Prefer How/Why/Explain/Compare.\n"
         "• Do not invent facts. If no single sentence supports A, pick a different question.\n\n"
         "In A, cover at least two distinct points from the chunk related to the anchor (no outside facts).\n\n"
+        "• Prefer How/Why/Compare, but “What … ?” is allowed for formal definitions.\n\n"
         f"Chunk:\n{chunk_text}"
     )
 
@@ -584,19 +586,31 @@ def _sentence_count(s: str) -> int:
 def quality_ok(anchor_raw, q, a, e, chunk_raw) -> bool:
     if not q or not a or not e:
         return False
-    if not re.match(r'^(How|Why|Explain|Compare|Under what conditions)\b', q):
-        return False
+
+    # Allow more starters; still bias toward open prompts.
+    if not re.match(r'^(How|Why|Explain|Compare|Under what conditions|In what ways|What)\b', q):
+        # Fallback: accept if it’s clearly a question (ends with ?)
+        if not q.strip().endswith("?"):
+            return False
+
+    # Anchor must appear in the QUESTION (you asked for that), but NOT necessarily in E:
     if normalize_for_match(anchor_raw) not in normalize_for_match(q):
         return False
-    # Accept normalized evidence containment (earlier stage already checked)
+
+    # Evidence must be verbatim from the chunk (normalized); don’t force anchor inside E.
     if _normalize_for_verbatim(e) not in _normalize_for_verbatim(chunk_raw):
         return False
+
+    # 3–4 sentences is ideal, but accept 2–6 to avoid false negatives.
     sc = _sentence_count(a)
     if sc < 2 or sc > 6:
         return False
+
     if BAD_ANCHOR_PAT.search(q.lower()):
         return False
+
     return True
+
 
 
 def extract_q_e(text):
@@ -651,40 +665,35 @@ def check_evidence_chunk(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, 
 
 def check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, q_raw, a_raw, kw_8, regen_left):
     """
-    1) Anchor must appear (normalized) inside the evidence.
-    2) If not, try one regen (parse) with same anchor.
-    3) If still bad, try the next anchor from kw_8 (fresh Q/A/E), and re-validate evidence-in-chunk.
+    Ensure E is actually in the chunk; if not, try one regen with the same anchor.
+    If still bad, try the next anchor. We DO NOT require the anchor to appear in E.
     """
-       # ANCHOR-IN-EVIDENCE uses NORMALIZED strings
-    if e_raw and anchor_norm in normalize_for_match(e_raw):
+    if e_raw and _normalize_for_verbatim(e_raw) in _normalize_for_verbatim(chunk_raw):
         return q_raw, a_raw, e_raw
 
     if regen_left > 0:
         resp = llm_generate_questions(chunk_raw, anchor_raw, q=q_raw, temperature=0.4)
         item = parse_qae(resp)
-        if item['ok'] and anchor_norm in normalize_for_match(item['e']):
+        if item['ok'] and _normalize_for_verbatim(item['e']) in _normalize_for_verbatim(chunk_raw):
             return item['q'], item['a'], item['e']
 
-    # Try next anchor
+    # Try the next anchor
     try:
         i = kw_8.index(anchor_raw)
         next_anchor_raw = kw_8[i+1]
     except (ValueError, IndexError):
         return q_raw, a_raw, e_raw
 
-    next_anchor_norm = normalize_for_match(next_anchor_raw)
-
-    # Fresh question for the next anchor; PARSE Q/A/E
     resp = llm_generate_questions(chunk_raw, next_anchor_raw, q=None, temperature=0.2)
     item = parse_qae(resp)
     if not item['ok']:
         return q_raw, a_raw, e_raw
 
-    # Ensure new evidence is actually in the chunk; if not, run evidence checker again
     return check_evidence_chunk(
-        chunk_norm, chunk_raw, next_anchor_norm, next_anchor_raw,
+        chunk_norm, chunk_raw, normalize_for_match(next_anchor_raw), next_anchor_raw,
         item['e'], item['q'], item['a'], kw_8, regen_left=1
     )
+
 
 def _norm_q(q: str) -> str:
     # reuse your normalizer for consistency
@@ -712,7 +721,7 @@ def _near_dupe(q: str, seen_norm_qs: set[str], seen_token_sets: list[set[str]], 
 
 
 def test_main():
-    size = 1500 # per question
+    size = 1100 # per question
     MAX_QUESTIONS = 24
     mode = input_content()
     text = extract_content(mode)
@@ -764,10 +773,12 @@ def test_main():
 
         # final gate — actually SKIP if not good
         if not quality_ok(anchor_raw, q, a, evidence, chunk_raw):
+            print(f"[skip] chunk={chunk_counter} anchor={anchor_raw!r} — failed quality_ok")
             continue
 
 # skip duplicate-ish questions
         if _near_dupe(q, _seen_norm_qs, _seen_token_sets, jaccard_threshold=0.75):
+            print(f"[dupe] chunk={chunk_counter} q={q[:60]!r}")
             continue
         _seen_norm_qs.add(_norm_q(q))
         _seen_token_sets.append(_tokens(q))
