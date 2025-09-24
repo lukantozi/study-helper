@@ -14,7 +14,7 @@ try:
 except Exception:
     _NLP = None
 import math
-from statistics import mean
+from collections import Counter, defaultdict
 
 
 # change the model when switching pc/laptop
@@ -34,6 +34,107 @@ except Exception as e:
     sys.exit(1)
 
 translator = str.maketrans('', '', string.punctuation)
+
+
+def sent_tokenize(s: str) -> list[str]:
+    return [x.strip() for x in re.split(r'(?<=[.!?])\s+', s) if x.strip()]
+
+def noun_phrases_or_rake(text: str) -> list[str]:
+    # prefer spaCy noun chunks if available; fallback to RAKE
+    if _NLP and not FORCE_RAKE:
+        try:
+            doc = _NLP(text)
+            cands = [re.sub(EXTRA_DASHES, "-", nc.text.strip()) for nc in doc.noun_chunks]
+        except Exception:
+            cands = []
+    else:
+        r = Rake()
+        r.extract_keywords_from_text(normalize_for_rake(text))
+        cands = [re.sub(EXTRA_DASHES, "-", x.strip()) for x in r.get_ranked_phrases()]
+    # normalize spacing
+    cands = [re.sub(r"\s+", " ", c).strip(" :;,.\"'()[]{}") for c in cands if c]
+    # dedupe (case-insensitive)
+    seen = set(); uniq = []
+    for c in cands:
+        k = c.lower()
+        if k not in seen:
+            seen.add(k); uniq.append(c)
+    return uniq
+
+def build_corpus_stats(chunks: list[str]):
+    """
+    Build DF/TF stats over *phrases* (not single words) extracted per chunk.
+    Returns (df, per_chunk_tf, chunk_norms, chunk_sents, position_maps)
+    """
+    df = Counter()
+    per_chunk_tf = []
+    chunk_norms = []
+    chunk_sents = []
+    position_maps = []  # earliest sentence index each phrase appears in
+
+    for ch in chunks:
+        sents = sent_tokenize(ch)
+        chunk_sents.append(sents)
+        ch_norm = normalize_for_match(ch)
+        chunk_norms.append(ch_norm)
+
+        cands = noun_phrases_or_rake(ch)
+        tf = Counter()
+        first_pos = {}
+        for i, s in enumerate(sents):
+            sn = normalize_for_match(s)
+            for cand in cands:
+                n = normalize_for_match(cand)
+                if not n: 
+                    continue
+                # candidate appears in this sentence?
+                if n in sn:
+                    tf[cand] += 1
+                    if cand not in first_pos:
+                        first_pos[cand] = i
+        per_chunk_tf.append(tf)
+        for cand in tf.keys():
+            df[cand] += 1
+        position_maps.append(first_pos)
+
+    return df, per_chunk_tf, chunk_norms, chunk_sents, position_maps
+
+def tfidf_score(cand: str, tf: Counter, df: Counter, N: int) -> float:
+    t = tf.get(cand, 0)
+    if t == 0: 
+        return 0.0
+    d = df.get(cand, 0)
+    idf = math.log(1 + (N / max(1, d)))
+    return t * idf
+
+def mmr_select(cands: list[str], cand_vecs: dict, k: int, diversity: float = 0.6):
+    """
+    Simple MMR using Jaccard over token sets (no embeddings needed).
+    cand_vecs[c] = set(tokens)
+    """
+    if not cands:
+        return []
+    selected = []
+    remaining = cands[:]
+    # normalize similarity
+    def sim(a, b):
+        A, B = cand_vecs[a], cand_vecs[b]
+        if not A or not B: return 0.0
+        return len(A & B) / float(len(A | B))
+    while remaining and len(selected) < k:
+        if not selected:
+            selected.append(remaining.pop(0))
+            continue
+        best, best_score = None, -1e9
+        for c in remaining:
+            rel = 1.0  # already baked into ranking earlier
+            div = max(sim(c, s) for s in selected) if selected else 0.0
+            score = diversity * rel - (1 - diversity) * div
+            if score > best_score:
+                best, best_score = c, score
+        remaining.remove(best)
+        selected.append(best)
+    return selected
 
 
 def _safe_generate(**kwargs):
@@ -423,13 +524,7 @@ def _fitz_child_worker(path, kwargs, q):
 
 def _fallback_pdfminer(path: str) -> str:
     try:
-        from pdfminer_high_level import extract_text as pdfminer_extract_text  # may differ in envs
-    except Exception:
-        try:
-            from pdfminer.high_level import extract_text as pdfminer_extract_text
-        except Exception:
-            return ""
-    try:
+        from pdfminer.high_level import extract_text as pdfminer_extract_text
         return pdfminer_extract_text(path) or ""
     except Exception:
         return ""
@@ -575,53 +670,37 @@ def chunks(chunk_size, sentences):
     return chunks
 
 
-def join_chunks(
-    chunk_size: int,
-    text: str,
-    overlap_sents: int = 0,
-    min_chunk_chars: int = 1800,
-    max_chunk_chars: int = 3200
-):
-    sents = split_sentences(text)
-    if not sents:
+def join_chunks(chunk_size, text, overlap_sents=2):
+    """
+    Sentence-based windows with overlap so we don't miss boundary info.
+    overlap_sents = how many sentences to carry over to the next chunk.
+    """
+    sentences = split_sentences(text)
+    if not sentences:
         return []
 
-    chunks, cur = [], []
+    chunks = []
+    cur = []
     cur_len = 0
+
     i = 0
-    while i < len(sents):
-        s = sents[i].strip()
+    while i < len(sentences):
+        s = sentences[i].strip()
         if not s:
             i += 1
             continue
 
-        # default target is chunk_size, but we also enforce min_chunk_chars
-        next_len = cur_len + len(s) + 1
-        if next_len <= chunk_size or (cur_len < min_chunk_chars and next_len <= max_chunk_chars):
+        if cur_len + len(s) + 1 <= chunk_size:
             cur.append(s)
-            cur_len = next_len
+            cur_len += len(s) + 1
             i += 1
-            continue
-
-        # time to emit; if still too small, force-grow up to max_chunk_chars
-        if cur and cur_len < min_chunk_chars and i < len(sents):
-            while i < len(sents) and cur_len < min_chunk_chars and cur_len + len(sents[i]) + 1 <= max_chunk_chars:
-                cur.append(sents[i].strip())
-                cur_len += len(sents[i]) + 1
-                i += 1
-
-        if cur:
-            chunks.append(" ".join(cur).strip())
-
-            # overlap tail (if requested)
-            tail = cur[-overlap_sents:] if overlap_sents > 0 else []
-            cur = tail[:]
-            cur_len = sum(len(x) + 1 for x in cur)
         else:
-            # pathological single long sentence
-            chunks.append(s[:max_chunk_chars])
-            i += 1
-            cur, cur_len = [], 0
+            if cur:
+                chunks.append(" ".join(cur).strip())
+            # start next window with overlap_sents tail from previous
+            tail = cur[-overlap_sents:] if overlap_sents > 0 else []
+            cur = tail[:]  # copy
+            cur_len = sum(len(x) + 1 for x in cur)
 
     if cur:
         chunks.append(" ".join(cur).strip())
@@ -629,156 +708,176 @@ def join_chunks(
     return chunks
 
 
-def _sent_stats(text: str):
-    sents = split_sentences(text)
-    if not sents:
-        return 0, 0, 0
-    lens = [len(s) for s in sents]
-    avg = mean(lens)
-    p50 = sorted(lens)[len(lens)//2]
-    p90 = sorted(lens)[int(len(lens)*0.9)]
-    return avg, p50, p90
+QUESTION_TEMPLATES = [
+    "How does {A} influence or determine {X} in the context described?",
+    "Why does {A} matter for {X}, and what are the key consequences discussed?",
+    "Compare {A} with an alternative approach/structure mentioned; what trade-offs emerge?",
+    "Under what conditions does {A} guarantee or fail to guarantee {X}?",
+    "Explain the mechanism by which {A} leads to {X}, citing a concrete detail."
+]
 
-def choose_chunking(text: str):
-    """
-    Heuristic chunking:
-    - Aim for ~ 12–24 sentences per chunk depending on sentence length.
-    - Never go below 1800 chars or above 3200 chars.
-    - Drop overlap if sentences are long; add a bit if short/clipped.
-    """
-    N = len(text)
-    avg, p50, p90 = _sent_stats(text)
-
-    # Base size from sentence statistics
-    if p50 == 0:
-        target = 2400
-    else:
-        target = int(min(max(p50 * 40, 1800), 3200))
-
-    # Adjust by document size bands
-    if N < 8_000:
-        target = max(target, 2200)
-    elif N > 80_000:
-        target = min(target, 2000)
-
-    # Overlap
-    if p90 > 180:
-        overlap = 0
-    elif p50 > 100:
-        overlap = 0
-    elif p50 > 60:
-        overlap = 1
-    else:
-        overlap = 2
-
-    target = int(min(max(target, 1800), 3200))
-    return target, overlap
+def build_qg_prompt_variants(chunk_text: str, anchor: str) -> str:
+    # ask for multiple candidates in one call to reduce latency
+    # Model returns three Q/A/E blocks, each following the same format.
+    template_hint = (
+        "Pick three *different* types from: causal, comparative, conditional, mechanism.\n"
+        "Vary the opener (How/Why/Explain/Compare/Under what conditions).\n"
+    )
+    return (
+        "You will produce THREE candidate study items from the chunk ONLY.\n"
+        "Each item must follow exactly:\n"
+        "Q: <one open question>\n"
+        "A: <3–4 sentences: cover a core idea; add one concrete detail from the chunk NOT used as E; add a consequence/implication; mention any stakeholder/scenario if present.>\n"
+        'E: "<copy ONE exact sentence from the chunk; include the final period>\"\n\n'
+        f'Anchor phrase that must appear verbatim in Q: "{anchor}"\n'
+        + template_hint +
+        "Do not say “in the text/passage”. Do not invent facts.\n"
+        "Select E as the single sentence that directly supports your answer.\n\n"
+        f"Chunk:\n{chunk_text}"
+    )
 
 
 FEW_SHOT = ""
 
 def build_qg_prompt(chunk_text: str, a) -> str:
-    # <<< FIX: relaxed, natural prompt (no “what it is, one property” cage)
     return (
-        "Write one high-quality study Q/A/E from THIS CHUNK ONLY.\n"
-        "Language: English.\n"
-        f'Anchor phrase: "{a}" (must appear verbatim in the question)\n\n'
-        "Output exactly:\n"
+        "You are writing study questions from the given chunk ONLY.\n"
+        "Respond in English only.\n"
+        f'Anchor phrase (must appear verbatim in the question): "{a}"\n\n'
+        "Output exactly these three lines, in this order:\n"
         "Q: <one open question>\n"
-        "A: <a clear answer in 2–4 sentences based only on the chunk>\n"
-        'E: "<copy exactly one supporting sentence from the chunk, with the period>"\n\n'
-        "Constraints:\n"
-        "• Start Q with How / Why / Explain / Compare / Under what conditions.\n"
-        "• Do NOT use phrases like 'this chunk/passage/text'.\n"
-        "• No outside facts.\n\n"
+        "A: <3–4 sentences covering: (1) the core idea; (2) one concrete detail from the chunk NOT used as E; "
+        "(3) one implication/consequence or why it matters; (4) mention any named stakeholder/scenario.>\n"
+        'E: "<copy ONE exact sentence from the chunk, include the final period>"\n\n'
+        "Rules:\n"
+        "• Start with How / Why / Explain / Compare / Under what conditions (avoid “What is…?” unless it’s a formal definition).\n"
+        "• No ‘in the text/passage/chunk’. No invented facts. If no single sentence supports A, choose a different question.\n"
+        f"• Make A **broad** (cover at least two distinct points from the chunk related to {a}) but still supported by E.\n\n"
         f"Chunk:\n{chunk_text}"
     )
-
 
 def build_reg_prompt(chunk_text: str, a, q) -> str:
     return (
         "Use only this chunk.\n"
-        "Respond in English only.\n"
-        f'Regenerate this question about "{a}": {q}\n'
+        "Produce ONE improved variant of the given question so that it is not definitional and remains open-ended.\n"
+        "Vary the style (causal/comparative/conditional/mechanism) but keep the same anchor.\n"
         "Output exactly:\n"
         "Q: <one question>\n"
-        "A: <3–4 sentences that cover the core idea and one concrete detail from the chunk that is not your E sentence>\n"
+        "A: <3–4 sentences: core idea; one concrete detail from the chunk NOT used as E; a consequence/implication; stakeholder/scenario if present>\n"
         'E: "<one exact sentence from the chunk; include the final period>"\n'
-        "Rules:\n"
-        f"• Include the anchor phrase verbatim: {a}\n"
-        "• Prefer How/Why/Explain/Compare. No “in the chunk/text”.\n"
-        "• Do not invent facts.\n\n"
+        f"Anchor phrase (must appear verbatim in Q): {a}\n"
+        "Do not write definition-style openings (e.g., “What is/are…”, “How is/are…”). Do not say “in the text/passage”.\n\n"
+        f"Original question: {q}\n\n"
         f"Chunk:\n{chunk_text}"
     )
 
-def _gen_worker(args, q):
-    try:
-        resp = ollama_client.generate(**args)
-        q.put(resp.get("response", ""))
-    except Exception:
-        q.put("")
-
-def safe_llm_call(args, timeout_sec=25):
-    q = mp.Queue()
-    p = mp.Process(target=_gen_worker, args=(args, q))
-    p.start()
-    p.join(timeout_sec)
-    if p.is_alive():
-        try: p.terminate()
-        except Exception: pass
-        p.join(2)
-        return ""  # timed out -> treat as failure
-    try:
-        return q.get_nowait()
-    except Exception:
-        return ""
 
 
-def _first_sentence_with_anchor(chunk_text: str, anchor: str) -> str:
-    sents = re.split(r'(?<=[.!?])\s+', chunk_text.strip())
-    n_anchor = normalize_for_match(anchor)
-    for s in sents:
-        if n_anchor in normalize_for_match(s):
-            return s.strip()
-    return sents[0].strip() if sents else chunk_text.strip()
+DEFY_RE = re.compile(r'^(?:how is|how are|what is|what are|define)\b', re.I)
+
+def _answer_sentence_coverage(a: str, chunk_sents: list[str]) -> int:
+    # count distinct chunk sentences that share ≥3 non-stopword tokens with A
+    stop = set("""a an the and or of to in on for with as by from at is are was were be been being that this those these it its if then else when where while into over under across among between within without not no nor""".split())
+    atok = [t for t in _tokens(a) if t not in stop]
+    if not atok:
+        return 0
+    A = set(atok)
+    count = 0
+    for s in chunk_sents:
+        S = set(t for t in _tokens(s) if t not in stop)
+        if len(A & S) >= 3:
+            count += 1
+    return count
+
+def score_qae_generic(q: str, a: str, e: str, chunk_raw: str) -> float:
+    if not q or not a or not e:
+        return -1e9
+    # opener check (but no domain words)
+    if not re.match(r'^(How|Why|Explain|Compare|Under what conditions)\b', q):
+        return -5
+    # avoid definition-style *patterns* (still domain-agnostic)
+    if DEFY_RE.search(q):
+        return -5
+    # anchor presence will be checked outside (we only score content here)
+    # E must be verbatim
+    if e not in chunk_raw:
+        return -5
+    # A length: 3–5 sentences preferable
+    sc = _sentence_count(a)
+    len_score = 1.0 if 3 <= sc <= 5 else (0.5 if 2 <= sc <= 6 else -2)
+    # coverage: reward referencing multiple chunk sentences
+    sents = sent_tokenize(chunk_raw)
+    cov = _answer_sentence_coverage(a, sents)
+    cov_score = min(cov, 3) * 0.8
+    # lexical diversity in Q
+    qdiv = min(len(_tokens(q)), 12) * 0.05
+    return len_score + cov_score + qdiv
+
 
 def llm_generate_questions(chunk_text: str, anchor, q=None, temperature: float = 0.2) -> str:
     opts = {
-        "temperature": 0.4,
+        "temperature": 0.5 if q is None else 0.4,
         "top_p": 0.95,
-        "num_predict": 256,
+        "num_predict": 384,
         "gpu_layers": 999,
         "num_ctx": 1024,
         "num_batch": 128,
     }
-    prompt = build_reg_prompt(chunk_text, anchor, q) if q else build_qg_prompt(chunk_text, anchor)
-    args = {"model": LLM_MODEL, "prompt": prompt, "options": opts}
-    resp = safe_llm_call(args, timeout_sec=25)
-    if not resp.strip():
-        # <<< FIX: anchor-aware, natural How/Why fallback (no “Explain … what it is …”)
-        e = _first_sentence_with_anchor(chunk_text, anchor)
-        if not re.search(r'[.!?]"?$', e): e += '.'
-        return (
-            f"Q: How does {anchor} influence the ideas presented, and why does it matter?\n"
-            "A: It plays a central role within the discussion by shaping how concepts connect and what results are possible. "
-            "Based on the passage, its use affects the structure/behavior described and leads to practical consequences for the scenario. "
-            "These consequences explain why the concept is emphasized and how it guides reasoning in this part of the text.\n"
-            f'E: "{e}"'
-        )
-    return resp
+    if q:
+        # regeneration path: keep your existing single-item prompt
+        prompt = build_reg_prompt(chunk_text, anchor, q)
+        resp = _safe_generate(model=LLM_MODEL, prompt=prompt, options=opts)
+        return resp["response"]
+
+    # multi-candidate path
+    prompt = build_qg_prompt_variants(chunk_text, anchor)
+    resp = _safe_generate(model=LLM_MODEL, prompt=prompt, options=opts)
+    return resp["response"]
+
+
+def best_evidence_for_answer(a: str, chunk_raw: str) -> str | None:
+    sents = sent_tokenize(chunk_raw)
+    stop = set("""a an the and or of to in on for with as by from at is are was were be been being that this those these it its if then else when where while into over under across among between within without not no nor""".split())
+    A = set(t for t in _tokens(a) if t not in stop)
+    best_s, best_score = None, 0.0
+    for s in sents:
+        S = set(t for t in _tokens(s) if t not in stop)
+        if not S: 
+            continue
+        # score = overlap + slight length prior to prefer complete statements
+        jac = len(A & S) / float(len(A | S)) if (A | S) else 0.0
+        score = jac + min(len(S), 25) * 0.005
+        if score > best_score:
+            best_s, best_score = s, score
+    return best_s
+
 
 
 def get_qae_or_regen(chunk_raw: str, anchor_raw: str, prev_q: str | None = None):
-    # 1st attempt
     resp = llm_generate_questions(chunk_raw, anchor_raw, q=prev_q, temperature=0.2)
-    item = parse_qae(resp)
+    items = parse_qae_items(resp) if not prev_q else [parse_qae(resp)]
+    # filter candidates: must include anchor in Q and in E (normalized)
+    anc_n = normalize_for_match(anchor_raw)
+    filtered = []
+    for it in items:
+        if not it.get('q') or not it.get('e'):
+            continue
+        if anc_n not in normalize_for_match(it['q']):
+            continue
+        if anc_n not in normalize_for_match(it['e']):
+            continue
+        filtered.append(it)
+    if not filtered:
+        # one regen attempt with previous Q (if any), else fallback to your old regen
+        if not prev_q and items and items[0].get('q'):
+            return get_qae_or_regen(chunk_raw, anchor_raw, prev_q=items[0]['q'])
+        return items[0] if items else {'ok': False, 'q': None, 'a': None, 'e': None, 'raw': resp, 'missing': set(['Q','A','E'])}
 
-    # If malformed (missing Q/A/E), try one regen
-    if not item['ok']:
-        resp = llm_generate_questions(chunk_raw, anchor_raw, q=(item.get('q') or prev_q or ""), temperature=0.2)
-        item = parse_qae(resp)
+    # score and choose the best
+    best = max(filtered, key=lambda it: score_qae_generic(it['q'], it['a'], it['e'], chunk_raw))
+    best['ok'] = True
+    return best
 
-    return item  # dict with keys: ok, q, a, e, missing
 
 
 BAD_ANCHOR_PAT = re.compile(
@@ -818,222 +917,44 @@ def _score_anchor(s: str) -> float:
         score -= 0.5
     return score
 
-def extract_keywords(chunk: str) -> list[str]:
-    c = re.sub(r"\s+", " ", chunk.strip())
-    cand = []
-    if _NLP and not FORCE_RAKE:
-        doc = _NLP(c)
-        for nc in doc.noun_chunks:
-            t = re.sub(EXTRA_DASHES, "-", nc.text.strip())
-            cand.append(t)
-    else:
-        r = Rake(min_length=2, max_length=5)
-        r.extract_keywords_from_text(normalize_for_rake(c))
-        cand = r.get_ranked_phrases()
+def extract_keywords_chunkwise(chunk_idx: int,
+                               chunks: list[str],
+                               df, per_chunk_tf, chunk_norms, chunk_sents, position_maps,
+                               topn: int = 10) -> list[str]:
+    N = len(chunks)
+    ch = chunks[chunk_idx]
+    tf = per_chunk_tf[chunk_idx]
+    sents = chunk_sents[chunk_idx]
+    pos_map = position_maps[chunk_idx]
 
-    seen, cleaned = set(), []
-    for s in cand:
-        key = s.lower()
-        if key not in seen:
-            seen.add(key)
-            cleaned.append(s)
+    # score candidates
+    scored = []
+    for cand in tf.keys():
+        base = tfidf_score(cand, tf, df, N)
+        # bonus if appears in earlier sentences (likely a section/definition line)
+        pos_bonus = 0.4 * (1.0 - (pos_map.get(cand, 0) / max(1, len(sents)-1)))
+        # casing signal: title case often marks named concepts
+        case_bonus = 0.3 if re.search(r"\b[A-Z][a-z]+\b", cand) else 0.0
+        # length prior: prefer multi-word but cap
+        tok = len(_token_words(cand))
+        len_bonus = 0.15 * min(tok, 6)
+        scored.append((cand, base + pos_bonus + case_bonus + len_bonus))
 
-    # score & filter
-    scored = [(s, _score_anchor(s)) for s in cleaned]
-    scored = [s for (s, sc) in scored if sc > 0]
+    scored.sort(key=lambda x: x[1], reverse=True)
 
-    # If RAKE/NLP failed, derive anchors from the chunk itself
-    if not scored:
-        tokens = re.findall(r"[A-Za-z]{3,}", c.lower())
-        stop = set("""
-            the a an and or of in on to for with by from as at is are was were be been being
-            this that these those it its their his her our your my we you they them he she
-            into over under between among about across within without during before after
-            not no yes more most less least very just also
-        """.split())
-        freq = {}
-        for t in tokens:
-            if t in stop:
-                continue
-            freq[t] = freq.get(t, 0) + 1
-        bigrams = []
-        for i in range(len(tokens) - 1):
-            a, b = tokens[i], tokens[i+1]
-            if a in stop or b in stop:
-                continue
-            bigrams.append(f"{a} {b}")
-        bigf = {}
-        for bg in bigrams:
-            bigf[bg] = bigf.get(bg, 0) + 1
+    # diversity via MMR on token sets (Jaccard)
+    cand_vecs = {c: _tokens(c) for c, _ in scored}
+    ordered = [c for c, _ in scored]
+    diverse = mmr_select(ordered, cand_vecs, k=min(topn, len(ordered)), diversity=0.65)
+    return diverse
 
-        top_bi = sorted(bigf.items(), key=lambda x: x[1], reverse=True)[:8]
-        top_uni = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:8]
-        fallback = [k for k,_ in top_bi] + [k for k,_ in top_uni]
-
-        def ok_anchor(s):
-            return 3 <= len(s) <= 70 and re.search(r"[a-z]", s) and not BAD_ANCHOR_PAT.search(s)
-
-        fallback = [s for s in fallback if ok_anchor(s)]
-        if not fallback:
-            fallback = ["key idea"]
-
-        return fallback[:8]
-
-    # normal path: rank by frequency & length
-    low = normalize_for_match(chunk)
-    freq = {}
-    for s in list(scored):
-        n = normalize_for_match(s)
-        freq[s] = low.count(n)
-    scored.sort(key=lambda s: (freq.get(s, 0), len(s)), reverse=True)
-    return scored[:8]
-
-
-BAD_SINGLE_WORDS = {
-    "use","way","one","two","three","form","word","think","learn","plan",
-    "different","exercise","example","problem","figure","table","section",
-    "reading","material","device","devices","technology","technologies"
-}
-BAD_CHARS = set("•/\\|,;:=+[]{}()<>«»·•\u00b7\u2022")
-
-def _alpha_ratio(s: str) -> float:
-    a = sum(ch.isalpha() for ch in s)
-    return a / max(1, len(s))
-
-def clean_anchors(cands: list[str], chunk_raw: str, want_n: int = 8) -> list[str]:
-    out = []
-    seen = set()
-    chunk_norm = normalize_for_match(chunk_raw)
-
-    for s in cands:
-        s0 = s.strip()
-        if not s0:
-            continue
-        key = s0.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        # drop if weird punctuation/bullets present
-        if any(ch in BAD_CHARS for ch in s0):
-            continue
-        if _alpha_ratio(s0) < 0.65:
-            continue
-
-        toks = re.findall(r"[A-Za-z][A-Za-z0-9\-']+", s0)
-        if len(toks) == 0:
-            continue
-        # prefer multi-word anchors; allow single only if not generic
-        if len(toks) == 1 and toks[0].lower() in BAD_SINGLE_WORDS:
-            continue
-
-        # length sanity
-        phrase = " ".join(toks)
-        if len(phrase) < 4 or len(phrase) > 70:
-            continue
-
-        # must actually occur (normalized) in the chunk
-        if normalize_for_match(s0) not in chunk_norm:
-            continue
-
-        out.append(s0)
-
-    # rank: multiword first, then by frequency in chunk, then by length
-    def rank_key(s: str):
-        toks = re.findall(r"[A-Za-z][A-Za-z0-9\-']+", s)
-        freq = chunk_norm.count(normalize_for_match(s))
-        return (
-            0 if len(toks) >= 2 else 1,
-            -freq,
-            -len(s)
-        )
-
-    out.sort(key=rank_key)
-
-    # fallback if we filtered everything: pick frequent bi/tri-grams
-    if not out:
-        words = re.findall(r"[A-Za-z][A-Za-z0-9']+", chunk_raw.lower())
-        grams: dict[str,int] = {}
-        for n in (3, 2):
-            for i in range(len(words) - n + 1):
-                g = " ".join(words[i:i+n])
-                if _alpha_ratio(g) < 0.9:
-                    continue
-                if any(w in BAD_SINGLE_WORDS for w in g.split()):
-                    continue
-                grams[g] = grams.get(g, 0) + 1
-
-        if grams:
-            out = [g for g, _cnt in sorted(grams.items(), key=lambda kv: kv[1], reverse=True)][:max(3, want_n // 2)]
-        else:
-            out = ["key idea"]
-
-    return out[:want_n]
-
-
-def dedupe_anchors(anchors: list[str]) -> list[str]:
-    # <<< FIX: simple, non-destructive dedupe (no aggressive lemmatization)
-    out, seen = [], set()
-    for a in anchors:
-        key = normalize_for_match(a)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(a.strip())
-    return out
-
-
-
-def pick_anchor(kw_8: list[str], chunk_raw: str) -> str:
-    if not chunk_raw.strip():
-        return kw_8[0] if kw_8 else "key idea"
-
-    low_chunk = normalize_for_match(chunk_raw)
-    sents_norm = [normalize_for_match(s) for s in _sentences(chunk_raw)]
-
-    def score_candidate(cand: str) -> float:
-        if not cand or _is_stop_phrase(cand):
-            return -1e9
-        n_cand = normalize_for_match(cand)
-        if not re.search(r"[a-z]", n_cand):
-            return -1e9
-        freq = low_chunk.count(n_cand)
-        if freq == 0:
-            return -1e9
-        coverage = sum(1 for sn in sents_norm if n_cand in sn)
-        tok_count = len(_token_words(cand))
-        letter_ratio = len(re.findall(r"[A-Za-z]", cand)) / max(1, len(cand))
-        has_digit = bool(re.search(r"\d", cand))
-        multiword_bonus = 0.4 if tok_count >= 2 else 0.0
-        length_bonus = min(tok_count, 6) * 0.1
-        digit_penalty = 0.6 if has_digit else 0.0
-        header_penalty = 0.8 if BAD_ANCHOR_PAT.search(cand) else 0.0
-        stop_like = 0.5 if cand.lower() in COMMON_STOP_PHRASES else 0.0
-
-        return (2.0 * freq) + (1.2 * coverage) + multiword_bonus + length_bonus \
-               + (0.3 * letter_ratio) - digit_penalty - header_penalty - stop_like
-
-    scored = [(cand, score_candidate(cand)) for cand in kw_8]
-    scored = [x for x in scored if x[1] > -1e8]
-    if scored:
-        scored.sort(key=lambda t: t[1], reverse=True)
-        return scored[0][0]
-
-    words = _token_words(chunk_raw)
-    grams = set()
-    for n in (3, 2):
-        for i in range(len(words) - n + 1):
-            cand = " ".join(words[i:i+n])
-            if not _is_stop_phrase(cand):
-                grams.add(cand)
-
-    scored_fallback = [(g, score_candidate(g)) for g in grams]
-    scored_fallback = [x for x in scored_fallback if x[1] > -1e8]
-    if scored_fallback:
-        scored_fallback.sort(key=lambda t: t[1], reverse=True)
-        return scored_fallback[0][0]
-
-    return kw_8[0] if kw_8 else "key idea"
+def pick_anchor(kw_list: list[str], chunk_raw: str) -> str:
+    # choose the first whose normalized form appears in chunk (guard against spurious phrases)
+    cn = normalize_for_match(chunk_raw)
+    for cand in kw_list:
+        if normalize_for_match(cand) in cn:
+            return cand
+    return kw_list[0] if kw_list else "key idea"
 
 
 def _sentence_count(s: str) -> int:
@@ -1080,12 +1001,14 @@ def check_evidence_chunk(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, 
     2) If not, try one regen (parse with parse_qae) and re-check.
     3) If still bad and regen_left exhausted, return what we have.
     """
+    # VERBATIM check uses RAW strings
     if e_raw and e_raw in chunk_raw:
         return check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw, q_raw, a_raw, kw_8, regen_left)
 
     if regen_left <= 0:
         return q_raw, a_raw, e_raw
 
+    # Regenerate with same anchor and previous question; PARSE Q/A/E
     resp = llm_generate_questions(chunk_raw, anchor_raw, q=q_raw, temperature=0.4)
     item = parse_qae(resp)
     if not item['ok']:
@@ -1101,8 +1024,9 @@ def check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw,
     """
     1) Anchor must appear (normalized) inside the evidence.
     2) If not, try one regen (parse) with same anchor.
-    3) If still bad, try the next anchor from kw_8 (fresh Q/A/E).
+    3) If still bad, try the next anchor from kw_8 (fresh Q/A/E), and re-validate evidence-in-chunk.
     """
+       # ANCHOR-IN-EVIDENCE uses NORMALIZED strings
     if e_raw and anchor_norm in normalize_for_match(e_raw):
         return q_raw, a_raw, e_raw
 
@@ -1121,17 +1045,20 @@ def check_anchor_evidence(chunk_norm, chunk_raw, anchor_norm, anchor_raw, e_raw,
 
     next_anchor_norm = normalize_for_match(next_anchor_raw)
 
+    # Fresh question for the next anchor; PARSE Q/A/E
     resp = llm_generate_questions(chunk_raw, next_anchor_raw, q=None, temperature=0.2)
     item = parse_qae(resp)
     if not item['ok']:
         return q_raw, a_raw, e_raw
 
+    # Ensure new evidence is actually in the chunk; if not, run evidence checker again
     return check_evidence_chunk(
         chunk_norm, chunk_raw, next_anchor_norm, next_anchor_raw,
         item['e'], item['q'], item['a'], kw_8, regen_left=1
     )
 
 def _norm_q(q: str) -> str:
+    # reuse your normalizer for consistency
     return normalize_for_match(q)
 
 def _tokens(s: str) -> set[str]:
@@ -1144,6 +1071,7 @@ def _near_dupe(q: str, seen_norm_qs: set[str], seen_token_sets: list[set[str]], 
     qt = _tokens(q)
     if not qt:
         return False
+    # lightweight near-duplicate check via Jaccard similarity on token sets
     for st in seen_token_sets:
         inter = len(qt & st)
         if inter == 0:
@@ -1154,43 +1082,47 @@ def _near_dupe(q: str, seen_norm_qs: set[str], seen_token_sets: list[set[str]], 
     return False
 
 
-def main():
+OPENERS = ["How", "Why", "Explain", "Compare", "Under what conditions"]
+_opener_idx = 0
+
+def rotate_opener(q: str) -> str:
+    global _opener_idx
+    if re.match(r'^(How|Why|Explain|Compare|Under what conditions)\b', q):
+        return q
+    opener = OPENERS[_opener_idx % len(OPENERS)]
+    _opener_idx += 1
+    # If model started with e.g. "Discuss", replace first token with desired opener
+    parts = q.split(None, 1)
+    tail = parts[1] if len(parts) > 1 else ""
+    return f"{opener} {tail}".strip()
+
+
+
+def test_main():
+    size = 3000 # per question
     mode = input_content()
     text = clean_text(extract_content(mode))
 
     print(f"[INFO] Extracted chars: {len(text)}")
 
+    # Optional safe mode cap (protects from pathological PDFs)
     MAX_CHARS = 200_000
     if len(text) > MAX_CHARS:
         print(f"[WARN] Truncating text to {MAX_CHARS} chars for safety.")
         text = text[:MAX_CHARS]
 
-    # --- automatic chunking ---
-    size, overlap = choose_chunking(text)
-    chunks = join_chunks(size, text, overlap_sents=overlap)
-    print(f"[INFO] Num chunks: {len(chunks)} (target={size}, overlap={overlap})")
 
-    # If we exploded into too many chunks, increase size until safe
-    MAX_CHUNKS = 60
-    while len(chunks) > MAX_CHUNKS and size < 3600:
-        size = int(size * 1.2)
-        size = min(size, 3600)
-        chunks = join_chunks(size, text, overlap_sents=max(0, overlap-1))
-        print(f"[INFO] Rechunk -> {len(chunks)} (size={size}, overlap={max(0, overlap-1)})")
+    chunks = join_chunks(size, text, overlap_sents=2)
 
-    # If we got too few chunks (e.g., 1) and text is long, shrink a bit
-    if len(chunks) <= 2 and len(text) > 12_000 and size > 2000:
-        size = int(size * 0.85)
-        size = max(1800, size)
-        chunks = join_chunks(size, text, overlap_sents=min(2, overlap+1))
-        print(f"[INFO] Rechunk small -> {len(chunks)} (size={size}, overlap={min(2, overlap+1)})")
-
-    # Hard cap
+    # Hard cap to avoid runaway chunk counts on messy PDFs
     MAX_CHUNKS = 60
     if len(chunks) > MAX_CHUNKS:
         print(f"[WARN] Limiting chunks from {len(chunks)} to {MAX_CHUNKS}.")
         chunks = chunks[:MAX_CHUNKS]
 
+    df, per_chunk_tf, chunk_norms, chunk_sents, position_maps = build_corpus_stats(chunks)
+
+    print(f"[INFO] Num chunks: {len(chunks)} (chunk_size={size}, overlap=2)")
 
     chunk_counter = 0
     ans_bank = []
@@ -1210,14 +1142,14 @@ def main():
         with open(csv_path, "w", newline="") as f:
             csv.writer(f).writerow(["q_idx", "chunk_idx", "anchor", "Q", "A", "E"])
 
-    # de-dupe state
+    # === de-dupe state (kept in case you hook it up later) ===
     _seen_norm_qs: set[str] = set()
     _seen_token_sets: list[set[str]] = []
 
-    # coverage
+    # === coverage ===
     coverage = {
         "total_chars": len(text),
-        "chunks_count": len(chunks),
+        "chunks_count": len(chunks),   # set AFTER chunks is created
         "anchors_attempted": 0,
         "qa_ok": 0,
         "qa_fallback": 0,
@@ -1226,56 +1158,33 @@ def main():
 
     for chunk_idx, chunk_raw in enumerate(chunks, start=1):
         chunk_counter = chunk_idx
-        kw_raw = extract_keywords(chunk_raw)
-        kw_8 = clean_anchors(kw_raw, chunk_raw, want_n=12)
-        kw_8 = dedupe_anchors(kw_8)[:8]
-        print(f"[DEBUG] anchors for chunk {chunk_idx}: {kw_8[:6]}")
-
-        alpha_ratio = sum(ch.isalpha() for ch in chunk_raw) / max(1, len(chunk_raw))
-        if alpha_ratio < 0.35 or len(kw_8) == 0:
-            print(f"[SKIP] chunk {chunk_idx}: low alpha ({alpha_ratio:.2f}) or no anchors")
-            continue
-
-        has_ok_anchors = len([kw for kw in kw_8 if len(kw) >= 4 and re.search(r'[a-z]', kw, re.I)]) >= 3
-        top_k = 1
-        if size >= 2400 and has_ok_anchors and alpha_ratio >= 0.45:
-            top_k = 2
-
+        kw_list = extract_keywords_chunkwise(
+        chunk_idx-1, chunks, df, per_chunk_tf, chunk_norms, chunk_sents, position_maps, topn=10
+    )
+        top_k = min(2, len(kw_list))   # try a couple anchors per chunk
         anchors_tried = 0
 
-        for anchor_raw in kw_8[:top_k]:
+        for anchor_raw in kw_list[:top_k]:
             coverage["anchors_attempted"] += 1
 
-            response = llm_generate_questions(chunk_raw, anchor_raw, q=None, temperature=0.2)
-            item = parse_qae(response)
+            item = get_qae_or_regen(chunk_raw, anchor_raw, prev_q=None)
+            q = item.get('q'); a = item.get('a'); evidence = item.get('e')
 
-            if not item['ok']:
-                response = llm_generate_questions(chunk_raw, anchor_raw, q=item.get('q') or "", temperature=0.2)
-                item = parse_qae(response)
-                if not item['ok']:
-                    # <<< FIX: natural How/Why fallback here too (no “Explain … what it is …”)
-                    sents = re.split(r'(?<=[.!?])\s+', chunk_raw.strip())
-                    def _norm(s): return normalize_for_match(s)
-                    e_fallback = next(
-                        (s for s in sents if _norm(anchor_raw) in _norm(s)),
-                        sents[0] if sents else chunk_raw.strip()
-                    )
-                    if not re.search(r'[.!?]"?$', e_fallback):
-                        e_fallback += '.'
-                    q_fallback = f"How does {anchor_raw} affect the topic discussed here, and why is it important?"
-                    a_fallback = ("It shapes the ideas presented by influencing the structure/behavior being described. "
-                                  "Its role leads to specific outcomes in the scenario, which explains why it matters in this part of the text.")
-                    item = {'ok': True, 'q': q_fallback, 'a': a_fallback, 'e': e_fallback, 'raw': '', 'missing': set()}
-                    coverage["qa_fallback"] += 1
-
-            q = item['q']; a = item['a']; evidence = item['e']
+            if not q or not a or not evidence:
+                q = f"How does {anchor_raw} relate to this chunk?"
+                sents = re.split(r'(?<=[.!?])\s+', chunk_raw.strip())
+                def _norm(s): return normalize_for_match(s)
+                evidence = next(
+                    (s for s in sents if _norm(anchor_raw) in _norm(s)),
+                    (sents[0] if sents else chunk_raw.strip())
+                )
+                a = "Answer: see the evidence and surrounding context in the chunk."
+                coverage["qa_fallback"] += 1
 
             # sanitize anchor and skip junky ones
             anchor_raw = clean_text(anchor_raw).strip().strip('",.- ')
-            if not re.match(r"[A-Za-z]", anchor_raw):
-                words = re.findall(r"[A-Za-z]{3,}", chunk_raw)
-                anchor_raw = " ".join(words[:2]) if words else "key idea"
             if (not re.search(r'[A-Za-z]', anchor_raw)) or len(anchor_raw) <= 2:
+                # try to salvage from Q (take a mid-length noun-ish phrase)
                 m = re.search(r'(?i)\b([A-Za-z][A-Za-z\- ]{3,40})\b', q or '')
                 anchor_raw = (m.group(1).strip() if m else 'key idea')
 
@@ -1284,23 +1193,26 @@ def main():
                 evidence = evidence.strip()
                 if not re.search(r'[.!?]"?$', evidence):
                     evidence += '.'
-                if evidence not in chunk_raw:
-                    sents = re.split(r'(?<=[.!?])\s+', chunk_raw.strip())
-                    norm_anchor = normalize_for_match(anchor_raw)
-                    cand = next((s for s in sents if norm_anchor in normalize_for_match(s)), None)
-                    if cand:
-                        evidence = cand.strip()
-                        if not re.search(r'[.!?]"?$', evidence):
-                            evidence += '.'
+                if not evidence or evidence not in chunk_raw:
+                    ev2 = best_evidence_for_answer(a or "", chunk_raw)
+                    if ev2:
+                        evidence = ev2 if ev2.endswith(('.', '!', '?')) else (ev2 + '.')
+
 
             # verify evidence + anchor; may regenerate once
-            chunk_norm, _, _ = validate_qs(chunk_raw, kw_8, evidence)
+            chunk_norm, _, _ = validate_qs(chunk_raw, kw_list, evidence)
             anchor_norm = normalize_for_match(anchor_raw)
             q, a, evidence = check_evidence_chunk(
                 chunk_norm=chunk_norm, chunk_raw=chunk_raw,
                 anchor_norm=anchor_norm, anchor_raw=anchor_raw,
-                e_raw=evidence, q_raw=q, a_raw=a, kw_8=kw_8, regen_left=1
+                e_raw=evidence, q_raw=q, a_raw=a, kw_8=kw_list, regen_left=1
             )
+
+            q = rotate_opener(q)
+            if _near_dupe(q, _seen_norm_qs, _seen_token_sets, jaccard_threshold=0.70):
+                continue
+            _seen_norm_qs.add(_norm_q(q))
+            _seen_token_sets.append(_tokens(q))
 
             # coverage
             coverage["qa_ok"] += 1
@@ -1327,6 +1239,7 @@ def main():
             with open(csv_path, "a", newline="", encoding="utf-8") as cf:
                 csv.writer(cf).writerow([emit_idx, chunk_counter, anchor_raw, q, a, evidence])
 
+    # tiny run summary
     # --- build Quizlet-ready exports ---
     quizlet = input("Would you like to export Q/A for quizlet?: ").lower()
     if quizlet in ["y", "yes"]:
@@ -1334,10 +1247,12 @@ def main():
         qa_path = os.path.join(quizlet_dir, f"quizlet-qa-{stamp}.csv")   # Q -> A
         qe_path = os.path.join(quizlet_dir, f"quizlet-qe-{stamp}.csv")   # Q -> E
 
+        # read back master CSV and write 2-col files
         rows = []
         with open(csv_path, "r", encoding="utf-8", newline="") as f:
             r = csv.DictReader(f)
             for row in r:
+                # light cleanup to avoid stray newlines/commas in fields
                 Q = (row.get("Q") or "").replace("\n", " ").strip()
                 A = (row.get("A") or "").replace("\n", " ").strip()
                 E = (row.get("E") or "").replace("\n", " ").strip()
@@ -1351,7 +1266,7 @@ def main():
                 if Q and A:
                     w.writerow([Q, A])
 
-        # write Q->E
+        # write Q->E (good for “locate the line that supports it” drills)
         with open(qe_path, "w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Question", "Answer"])
@@ -1379,7 +1294,7 @@ if __name__ == "__main__":
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
+        # start method already set – ignore
         pass
 
-    main()
-
+    test_main()
